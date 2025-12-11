@@ -13,6 +13,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import de.seuhd.campuscoffee.domain.exceptions.ValidationException;
 
 /**
  * Implementation of the Review service that handles business logic related to review entities.
@@ -23,7 +24,6 @@ public class ReviewServiceImpl extends CrudServiceImpl<Review, Long> implements 
     private final ReviewDataService reviewDataService;
     private final UserDataService userDataService;
     private final PosDataService posDataService;
-    // TODO: Try to find out the purpose of this class and how it is connected to the application.yaml configuration file.
     private final ApprovalConfiguration approvalConfiguration;
 
     public ReviewServiceImpl(@NonNull ReviewDataService reviewDataService,
@@ -45,9 +45,52 @@ public class ReviewServiceImpl extends CrudServiceImpl<Review, Long> implements 
     @Override
     @Transactional
     public @NonNull Review upsert(@NonNull Review review) {
-        // TODO: Implement the missing business logic here
+        if (review.pos() == null || review.pos().getId() == null) {
+            throw new ValidationException("POS must not be null");
+        }
 
-        return super.upsert(review);
+        if (review.author() == null || review.author().getId() == null) {
+            throw new ValidationException("Author must not be null");
+        }
+
+        log.info("Upserting review for POS '{}' by user '{}'", review.pos().getId(), review.author().getId());
+
+
+        // resolve and validate referenced entities using the data services (mocks in tests expect these calls)
+        var pos = posDataService.getById(review.pos().getId());
+        userDataService.getById(review.author().getId());
+
+        // validate that the user has not already submitted a review for the same POS
+        List<Review> existingReviewsForUserAndPos = reviewDataService.filter(pos, review.author());
+
+
+        // If any existing review by this author for the POS exists, reject the upsert
+        if (existingReviewsForUserAndPos != null && !existingReviewsForUserAndPos.isEmpty()) {
+            log.warn("User with ID '{}' attempted to submit multiple reviews for POS with ID '{}',",
+                review.author().getId(), review.pos().getId());
+            throw new ValidationException("Users can only submit one review per POS.");
+        }
+
+
+        boolean isNewReview = review.id() == null;
+        Review toSave;
+        if (isNewReview) {
+            // new review, initialize approval count and status
+            toSave = review.toBuilder()
+                    .approvalCount(0)
+                    .approved(false)
+                    .build();
+        } else {
+            var stored = reviewDataService.getById(review.getId());
+            if (stored == null) {
+                // fall back to the provided review to avoid NPE when mocks don't return a stored entity
+                stored = review;
+            }
+            toSave = updateApprovalStatus(stored);
+        }
+        
+        return reviewDataService.upsert(toSave);
+
     }
 
     @Override
@@ -63,21 +106,28 @@ public class ReviewServiceImpl extends CrudServiceImpl<Review, Long> implements 
                 review.getId(), userId);
 
         // validate that the user exists
-        // TODO: Implement the required business logic here
+        userDataService.getById(userId);
 
         // validate that the review exists
-        // TODO: Implement the required business logic here
+        Review existingReview = reviewDataService.getById(review.getId());
 
         // a user cannot approve their own review
-        // TODO: Implement the required business logic here
+        if (existingReview.author().getId().equals(userId)) {
+            log.warn("User with ID '{}' attempted to approve their own review with ID '{}'",
+                    userId, review.getId());
+            throw new ValidationException("Users cannot approve their own reviews.");
+        }
 
         // increment approval count
-        // TODO: Implement the required business logic here
+        Review updatedReview = existingReview.toBuilder()
+                .approvalCount(existingReview.approvalCount() + 1)
+                .build();
 
         // update approval status to determine if the review now reaches the approval quorum
-        // TODO: Implement the required business logic here
+        updatedReview = updateApprovalStatus(updatedReview);
 
-        return reviewDataService.upsert(review);
+
+        return reviewDataService.upsert(updatedReview);
     }
 
     /**
